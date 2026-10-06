@@ -1351,7 +1351,7 @@ class CustomerSchemeInstallmentsAPIView(APIView):
 
 
 
-class SchemeInitiateRazorpayAPIView(APIView):
+class SchemeInitiateRazorpayAPIView_old(APIView):
 
     def post(self, request):
 
@@ -1429,7 +1429,7 @@ class SchemeInitiateRazorpayAPIView(APIView):
 
 
 
-class SchemeConfirmRazorpayAPIView(APIView):
+class SchemeConfirmRazorpayAPIView_old(APIView):
 
     def post(self, request):
 
@@ -1589,6 +1589,1012 @@ class SchemeConfirmRazorpayAPIView(APIView):
             )
 
     
+
+
+
+
+
+
+from decimal import Decimal, InvalidOperation
+
+from django.db import transaction
+from django.db.models import Sum
+from django.utils import timezone
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+import razorpay
+
+from django.conf import settings
+
+from drf_spectacular.utils import extend_schema
+
+
+class SchemeInitiateRazorpayAPIView(APIView):
+
+    """
+    Initiate Razorpay payment for an existing scheme installment.
+
+    Supports:
+
+    1. Full installment payment
+    2. Partial installment payment
+
+    This API is NOT used for new scheme enrollment.
+
+    New scheme enrollment is handled by:
+        SchemeEnrollmentInitiateRazorpayAPIView
+    """
+
+    @extend_schema(
+        request=None
+    )
+    def post(self, request):
+
+        installment_id = request.data.get("installment_id")
+        payment_amount = request.data.get("payment_amount")
+
+        # ============================================================
+        # VALIDATION
+        # ============================================================
+
+        if not installment_id:
+            return Response(
+                {
+                    "success": False,
+                    "message": "installment_id is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if payment_amount is None:
+            return Response(
+                {
+                    "success": False,
+                    "message": "payment_amount is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # GET INSTALLMENT
+        # ============================================================
+
+        try:
+
+            installment = (
+                SchemeInstallment.objects
+                .select_related(
+                    "enrollment",
+                    "enrollment__customer",
+                    "enrollment__scheme",
+                )
+                .get(
+                    installment_id=installment_id
+                )
+            )
+
+        except SchemeInstallment.DoesNotExist:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Installment not found."
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        enrollment = installment.enrollment
+        customer = enrollment.customer
+        scheme = enrollment.scheme
+
+        # ============================================================
+        # CHECK ENROLLMENT
+        # ============================================================
+
+        if enrollment.status != "active":
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "Payment cannot be made because "
+                        "the scheme enrollment is not active."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # CHECK INSTALLMENT STATUS
+        # ============================================================
+
+        if installment.status == "paid":
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "This installment is already fully paid."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if installment.status == "cancelled":
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "This installment has been cancelled."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # CALCULATE REMAINING AMOUNT
+        # ============================================================
+
+        installment_amount = Decimal(
+            str(installment.amount)
+        )
+
+        already_paid = Decimal(
+            str(installment.paid_amount or 0)
+        )
+
+        remaining_amount = (
+            installment_amount - already_paid
+        )
+
+        if remaining_amount <= Decimal("0.00"):
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "This installment is already fully paid."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # VALIDATE PAYMENT AMOUNT
+        # ============================================================
+
+        try:
+
+            payment_amount = Decimal(
+                str(payment_amount)
+            )
+
+        except (InvalidOperation, ValueError):
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid payment_amount."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        payment_amount = payment_amount.quantize(
+            Decimal("0.01")
+        )
+
+        if payment_amount <= Decimal("0.00"):
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "payment_amount must be greater than zero."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # PAYMENT CANNOT EXCEED REMAINING AMOUNT
+        # ============================================================
+
+        if payment_amount > remaining_amount:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        f"Payment amount cannot exceed the remaining "
+                        f"installment amount of ₹{remaining_amount}."
+                    ),
+                    "installment_amount": str(installment_amount),
+                    "already_paid": str(already_paid),
+                    "remaining_amount": str(remaining_amount),
+                    "requested_amount": str(payment_amount),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # CHECK EXISTING PENDING TRANSACTION
+        # ============================================================
+
+        pending_transaction = (
+            SchemeTransaction.objects
+            .filter(
+                enrollment=enrollment,
+                installment=installment,
+                status="pending"
+            )
+            .order_by("-transaction_id")
+            .first()
+        )
+
+        if pending_transaction:
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "Pending payment already exists.",
+                    "razorpay_key": settings.RAZORPAY_KEY_ID,
+                    "razorpay_order_id": (
+                        pending_transaction.razorpay_order_id
+                    ),
+                    "transaction_id": (
+                        pending_transaction.transaction_id
+                    ),
+                    "customer_id": customer.pk,
+                    "scheme_id": scheme.pk,
+                    "enrollment_id": enrollment.pk,
+                    "installment_id": installment.installment_id,
+                    "installment_no": installment.installment_no,
+                    "installment_amount": str(
+                        installment_amount
+                    ),
+                    "already_paid": str(
+                        already_paid
+                    ),
+                    "remaining_amount": str(
+                        remaining_amount
+                    ),
+                    "payment_amount": str(
+                        pending_transaction.amount
+                    ),
+                },
+                status=status.HTTP_200_OK
+            )
+
+        # ============================================================
+        # CREATE RAZORPAY ORDER
+        # ============================================================
+
+        razorpay_amount = int(
+            payment_amount * Decimal("100")
+        )
+
+        try:
+
+            client = razorpay.Client(
+                auth=(
+                    settings.RAZORPAY_KEY_ID,
+                    settings.RAZORPAY_KEY_SECRET
+                )
+            )
+
+            razorpay_order = client.order.create(
+                {
+                    "amount": razorpay_amount,
+                    "currency": "INR",
+                    "payment_capture": 1,
+                }
+            )
+
+        except Exception as e:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Unable to create Razorpay order.",
+                    "error": str(e)
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # ============================================================
+        # CREATE TRANSACTION
+        # ============================================================
+
+        txn = SchemeTransaction.objects.create(
+
+            customer=customer,
+
+            scheme=scheme,
+
+            enrollment=enrollment,
+
+            installment=installment,
+
+            amount=payment_amount,
+
+            razorpay_order_id=razorpay_order["id"],
+
+            status="pending",
+
+            remarks=(
+                f"Installment #{installment.installment_no} "
+                f"payment."
+            )
+        )
+
+        # ============================================================
+        # RESPONSE
+        # ============================================================
+
+        return Response(
+            {
+                "success": True,
+                "message": "Razorpay payment order created successfully.",
+
+                "razorpay_key": settings.RAZORPAY_KEY_ID,
+
+                "razorpay_order_id": (
+                    razorpay_order["id"]
+                ),
+
+                "transaction_id": txn.transaction_id,
+
+                "customer_id": customer.pk,
+
+                "scheme_id": scheme.pk,
+
+                "enrollment_id": enrollment.pk,
+
+                "installment_id": (
+                    installment.installment_id
+                ),
+
+                "installment_no": (
+                    installment.installment_no
+                ),
+
+                "installment_amount": str(
+                    installment_amount
+                ),
+
+                "already_paid": str(
+                    already_paid
+                ),
+
+                "remaining_amount": str(
+                    remaining_amount
+                ),
+
+                "payment_amount": str(
+                    payment_amount
+                ),
+            },
+            status=status.HTTP_201_CREATED
+        )
+
+
+
+class SchemeConfirmRazorpayAPIView(APIView):
+
+    """
+    Confirm Razorpay payment for an existing scheme installment.
+
+    Supports:
+
+    - Full installment payment
+    - Partial installment payment
+    - Multiple partial payments for the same installment
+
+    This API is NOT used for new scheme enrollment.
+    """
+
+    @extend_schema(
+        request=None
+    )
+    @transaction.atomic
+    def post(self, request):
+
+        razorpay_order_id = request.data.get(
+            "razorpay_order_id"
+        )
+
+        razorpay_payment_id = request.data.get(
+            "razorpay_payment_id"
+        )
+
+        razorpay_signature = request.data.get(
+            "razorpay_signature"
+        )
+
+        # ============================================================
+        # VALIDATION
+        # ============================================================
+
+        if not razorpay_order_id:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "razorpay_order_id is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not razorpay_payment_id:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "razorpay_payment_id is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not razorpay_signature:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "razorpay_signature is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # VERIFY RAZORPAY SIGNATURE
+        # ============================================================
+
+        try:
+
+            client = razorpay.Client(
+                auth=(
+                    settings.RAZORPAY_KEY_ID,
+                    settings.RAZORPAY_KEY_SECRET
+                )
+            )
+
+            client.utility.verify_payment_signature(
+                {
+                    "razorpay_order_id": razorpay_order_id,
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "razorpay_signature": razorpay_signature,
+                }
+            )
+
+        except razorpay.errors.SignatureVerificationError:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid Razorpay payment signature."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        except Exception as e:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Payment verification failed.",
+                    "error": str(e)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # GET TRANSACTION WITH LOCK
+        # ============================================================
+
+        try:
+
+            txn = (
+                SchemeTransaction.objects
+                .select_for_update()
+                .select_related(
+                    "customer",
+                    "scheme",
+                    "enrollment",
+                    "installment",
+                )
+                .get(
+                    razorpay_order_id=razorpay_order_id
+                )
+            )
+
+        except SchemeTransaction.DoesNotExist:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Payment transaction not found."
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # ============================================================
+        # IDEMPOTENCY
+        # ============================================================
+
+        if txn.status == "success":
+
+            return Response(
+                {
+                    "success": True,
+                    "message": "Payment already verified successfully.",
+                    "transaction_id": txn.transaction_id,
+                    "razorpay_payment_id": (
+                        txn.razorpay_payment_id
+                    ),
+                    "status": "success",
+                },
+                status=status.HTTP_200_OK
+            )
+
+        # ============================================================
+        # VALIDATE TRANSACTION TYPE
+        # ============================================================
+
+        if txn.enrollment is None or txn.installment is None:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "Invalid transaction. "
+                        "This API is only for existing "
+                        "scheme installment payments."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        installment = (
+            SchemeInstallment.objects
+            .select_for_update()
+            .select_related(
+                "enrollment",
+                "enrollment__customer",
+                "enrollment__scheme",
+            )
+            .get(
+                installment_id=txn.installment.installment_id
+            )
+        )
+
+        enrollment = installment.enrollment
+
+        # ============================================================
+        # VERIFY CUSTOMER / SCHEME
+        # ============================================================
+
+        if txn.customer_id != enrollment.customer_id:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Transaction customer mismatch."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if txn.scheme_id != enrollment.scheme_id:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Transaction scheme mismatch."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # VERIFY INSTALLMENT
+        # ============================================================
+
+        if installment.status == "cancelled":
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "This installment has been cancelled."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # GET RAZORPAY PAYMENT DETAILS
+        # ============================================================
+
+        try:
+
+            payment_details = client.payment.fetch(
+                razorpay_payment_id
+            )
+
+            payment_method = payment_details.get(
+                "method"
+            )
+
+            razorpay_paid_amount = Decimal(
+                str(
+                    payment_details.get(
+                        "amount",
+                        0
+                    )
+                )
+            ) / Decimal("100")
+
+        except Exception as e:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Unable to fetch Razorpay payment details.",
+                    "error": str(e)
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # VERIFY AMOUNT
+        # ============================================================
+
+        transaction_amount = Decimal(
+            str(txn.amount)
+        ).quantize(
+            Decimal("0.01")
+        )
+
+        razorpay_paid_amount = razorpay_paid_amount.quantize(
+            Decimal("0.01")
+        )
+
+        if razorpay_paid_amount != transaction_amount:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Razorpay payment amount does not match transaction amount.",
+                    "transaction_amount": str(
+                        transaction_amount
+                    ),
+                    "razorpay_paid_amount": str(
+                        razorpay_paid_amount
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # CURRENT INSTALLMENT BALANCE
+        # ============================================================
+
+        installment_amount = Decimal(
+            str(installment.amount)
+        )
+
+        current_paid_amount = Decimal(
+            str(installment.paid_amount or 0)
+        )
+
+        remaining_before_payment = (
+            installment_amount -
+            current_paid_amount
+        )
+
+        # ============================================================
+        # PREVENT OVER PAYMENT
+        # ============================================================
+
+        if transaction_amount > remaining_before_payment:
+
+            return Response(
+                {
+                    "success": False,
+                    "message": (
+                        "Payment amount exceeds the remaining "
+                        "installment amount."
+                    ),
+                    "installment_amount": str(
+                        installment_amount
+                    ),
+                    "already_paid": str(
+                        current_paid_amount
+                    ),
+                    "remaining_amount": str(
+                        remaining_before_payment
+                    ),
+                    "payment_amount": str(
+                        transaction_amount
+                    ),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ============================================================
+        # ADD PAYMENT TO INSTALLMENT
+        # ============================================================
+
+        new_paid_amount = (
+            current_paid_amount +
+            transaction_amount
+        )
+
+        new_paid_amount = new_paid_amount.quantize(
+            Decimal("0.01")
+        )
+
+        # ============================================================
+        # DETERMINE STATUS
+        # ============================================================
+
+        if new_paid_amount >= installment_amount:
+
+            new_paid_amount = installment_amount
+
+            installment.status = "paid"
+
+        else:
+
+            installment.status = "partial"
+
+        installment.paid_amount = new_paid_amount
+
+        installment.payment_mode = payment_method
+
+        installment.transaction_reference = (
+            razorpay_payment_id
+        )
+
+        installment.paid_date = (
+            timezone.now().date()
+        )
+
+        installment.save(
+            update_fields=[
+                "paid_amount",
+                "status",
+                "payment_mode",
+                "transaction_reference",
+                "paid_date",
+            ]
+        )
+
+        # ============================================================
+        # UPDATE TRANSACTION
+        # ============================================================
+
+        txn.razorpay_payment_id = (
+            razorpay_payment_id
+        )
+
+        txn.razorpay_signature = (
+            razorpay_signature
+        )
+
+        txn.payment_method = (
+            payment_method
+        )
+
+        txn.status = "success"
+
+        txn.save(
+            update_fields=[
+                "razorpay_payment_id",
+                "razorpay_signature",
+                "payment_method",
+                "status",
+            ]
+        )
+
+        # ============================================================
+        # CREATE RECEIPT
+        # ============================================================
+
+        receipt_number = (
+            f"RCPT-{timezone.now().strftime('%Y%m%d%H%M%S')}"
+            f"-{txn.transaction_id}"
+        )
+
+        receipt = SchemeReceipt.objects.create(
+
+            installment=installment,
+
+            receipt_number=receipt_number,
+
+            receipt_date=timezone.now().date(),
+
+            amount=transaction_amount,
+
+            payment_mode=payment_method,
+
+            transaction_reference=razorpay_payment_id,
+
+            remarks=(
+                f"Razorpay payment for "
+                f"installment #{installment.installment_no}"
+            )
+        )
+
+        # ============================================================
+        # UPDATE ENROLLMENT SUMMARY
+        # ============================================================
+
+        total_paid_amount = (
+            enrollment.installments.aggregate(
+                total=Sum("paid_amount")
+            )["total"]
+            or Decimal("0.00")
+        )
+
+        paid_installments = (
+            enrollment.installments.filter(
+                status="paid"
+            ).count()
+        )
+
+        total_installments = (
+            enrollment.total_installments
+        )
+
+        pending_installments = (
+            total_installments -
+            paid_installments
+        )
+
+        enrollment.paid_installments = (
+            paid_installments
+        )
+
+        enrollment.pending_installments = (
+            pending_installments
+        )
+
+        enrollment.total_paid_amount = (
+            total_paid_amount
+        )
+
+        # ============================================================
+        # COMPLETED / ACTIVE
+        # ============================================================
+
+        if paid_installments >= total_installments:
+
+            enrollment.status = "completed"
+
+        else:
+
+            enrollment.status = "active"
+
+        enrollment.save(
+            update_fields=[
+                "paid_installments",
+                "pending_installments",
+                "total_paid_amount",
+                "status",
+            ]
+        )
+
+        # ============================================================
+        # REMAINING INSTALLMENT AMOUNT
+        # ============================================================
+
+        remaining_after_payment = (
+            installment_amount -
+            new_paid_amount
+        )
+
+        # ============================================================
+        # RESPONSE
+        # ============================================================
+
+        return Response(
+            {
+                "success": True,
+
+                "message": (
+                    "Installment payment completed successfully."
+                    if installment.status == "paid"
+                    else
+                    "Partial installment payment completed successfully."
+                ),
+
+                "transaction": {
+                    "transaction_id": (
+                        txn.transaction_id
+                    ),
+
+                    "razorpay_order_id": (
+                        txn.razorpay_order_id
+                    ),
+
+                    "razorpay_payment_id": (
+                        txn.razorpay_payment_id
+                    ),
+
+                    "payment_method": (
+                        txn.payment_method
+                    ),
+
+                    "amount": str(
+                        transaction_amount
+                    ),
+
+                    "status": txn.status,
+                },
+
+                "enrollment": {
+                    "enrollment_id": (
+                        enrollment.enrollment_id
+                    ),
+
+                    "paid_installments": (
+                        enrollment.paid_installments
+                    ),
+
+                    "pending_installments": (
+                        enrollment.pending_installments
+                    ),
+
+                    "total_paid_amount": str(
+                        enrollment.total_paid_amount
+                    ),
+
+                    "status": enrollment.status,
+                },
+
+                "installment": {
+                    "installment_id": (
+                        installment.installment_id
+                    ),
+
+                    "installment_no": (
+                        installment.installment_no
+                    ),
+
+                    "installment_amount": str(
+                        installment_amount
+                    ),
+
+                    "previously_paid": str(
+                        current_paid_amount
+                    ),
+
+                    "payment_amount": str(
+                        transaction_amount
+                    ),
+
+                    "total_paid": str(
+                        new_paid_amount
+                    ),
+
+                    "remaining_amount": str(
+                        remaining_after_payment
+                    ),
+
+                    "status": installment.status,
+                },
+
+                "receipt": {
+                    "receipt_id": (
+                        receipt.receipt_id
+                    ),
+
+                    "receipt_number": (
+                        receipt.receipt_number
+                    ),
+
+                    "amount": str(
+                        receipt.amount
+                    ),
+                },
+            },
+            status=status.HTTP_200_OK
+        )
+
+
 
 
 
